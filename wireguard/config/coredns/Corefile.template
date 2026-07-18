@@ -1,0 +1,9 @@
+.:53 {
+  errors
+  health
+  ready
+  forward . ${ADGUARD_IP}:53
+  cache 30
+  loop
+  reload
+}

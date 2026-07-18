@@ -1,0 +1,247 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  traefik:
+    # v3.6.1+ necessário para Docker Engine 29+ (API min 1.44; Traefik antigo usava client 1.24)
+    image: traefik:v3.6.23
+    container_name: traefik
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      proxy_network:
+      internal_services_net:
+        ipv4_address: ${TRAEFIK_IP}
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CF_DNS_API_TOKEN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/acme.json:/acme.json
+    command:
+      #- "--log.level=DEBUG"
+      - "--log.format=common"
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.network=proxy_network"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.traefik.address=:8080"
+      - "--ping=true"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.myresolver.acme.dnschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/acme.json"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=myresolver"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=vpn-peer@docker"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:1.0.20250521
+    container_name: wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Sao_Paulo
+      - SERVERURL=guard.${DOMAIN}
+      # Porta pública no Endpoint dos peers; o container continua ouvindo 51820
+      - SERVERPORT=${WG_PORT}
+      - PEERS=${WG_PEERS}
+      # IP DNS fixo entregue aos peers no túnel (DNS interno/CoreDNS do WireGuard)
+      - PEERDNS=${VPN_GATEWAY}
+      - INTERNAL_SUBNET=${VPN_NETWORK}
+      - ALLOWEDIPS=0.0.0.0/0
+      # Usados pelos scripts em /scripts (PostUp / DNAT+SNAT)
+      - VPN_GATEWAY=${VPN_GATEWAY}
+      - VPN_SUBNET=${VPN_SUBNET}
+      - WIREGUARD_IP=${WIREGUARD_IP}
+      - WG_VPN_IP=${VPN_GATEWAY}
+      - WG_SNAT_IP=${WIREGUARD_IP}
+      - TRAEFIK_IP=${TRAEFIK_IP}
+    volumes:
+      - ./wireguard/config:/config
+      - ./wireguard/scripts:/scripts
+      - /lib/modules:/lib/modules
+    ports:
+      - "${WG_PORT}:51820/udp"
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      proxy_network:
+      internal_services_net:
+        ipv4_address: ${WIREGUARD_IP}
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wg show | grep -q '^interface' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 45s
+
+  adguard:
+    image: adguard/adguardhome:v0.107.73
+    container_name: adguard
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      traefik:
+        condition: service_started
+    networks:
+      proxy_network:
+      internal_services_net:
+        ipv4_address: ${ADGUARD_IP}
+    volumes:
+      - ./adguard/work:/opt/adguardhome/work
+      - ./adguard/conf:/opt/adguardhome/conf
+    # Acesso à interface web somente via Traefik (middleware vpn-peer)
+    #ports:
+    #   - "53:53/udp"
+    #   - "53:53/tcp"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      # Peers VPN_SUBNET + SNAT do container wireguard (WIREGUARD_IP) após DNAT para o Traefik
+      - "traefik.http.middlewares.vpn-peer.ipallowlist.sourcerange=${VPN_SUBNET},${WIREGUARD_IP}/32"
+      - "traefik.http.routers.adguard.rule=Host(`dns.${DOMAIN}`)"
+      - "traefik.http.routers.adguard.entrypoints=websecure"
+      - "traefik.http.routers.adguard.tls.certresolver=myresolver"
+      - "traefik.http.routers.adguard.middlewares=vpn-peer@docker"
+      - "traefik.http.services.adguard.loadbalancer.server.port=80"
+    # Assistente inicial costuma usar :3000; depois da configuração, a interface fica em :80
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || wget -q --spider http://127.0.0.1:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+  # Teste de velocidade contra este servidor (público).
+  librespeed:
+    image: lscr.io/linuxserver/librespeed:6.1.0
+    container_name: librespeed
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      - TZ=America/Sao_Paulo
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - ./librespeed_data:/config
+    networks:
+      proxy_network:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      - "traefik.http.routers.speed.rule=Host(`speed.${DOMAIN}`)"
+      - "traefik.http.routers.speed.entrypoints=websecure"
+      - "traefik.http.routers.speed.tls.certresolver=myresolver"
+      - "traefik.http.services.speed.loadbalancer.server.port=80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:80/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Monitoramento de uptime/HTTP dos serviços. https://github.com/louislam/uptime-kuma
+  uptime-kuma:
+    image: louislam/uptime-kuma:2.4.0
+    container_name: uptime-kuma
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./uptime-kuma/data:/app/data
+    networks:
+      proxy_network:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      - "traefik.http.routers.uptime.rule=Host(`uptime.${DOMAIN}`)"
+      - "traefik.http.routers.uptime.entrypoints=websecure"
+      - "traefik.http.routers.uptime.tls.certresolver=myresolver"
+      - "traefik.http.services.uptime.loadbalancer.server.port=3001"
+    healthcheck:
+      test: ["CMD-SHELL", "extra/healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  pairdrop:
+    image: lscr.io/linuxserver/pairdrop:1.11.2
+    container_name: pairdrop
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Sao_Paulo
+    networks:
+      proxy_network:
+    #ports:
+    #  - 8081:3000
+    restart: unless-stopped
+    logging: *default-logging
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      - "traefik.http.routers.pairdrop.rule=Host(`send.${DOMAIN}`)"
+      - "traefik.http.routers.pairdrop.entrypoints=websecure"
+      - "traefik.http.routers.pairdrop.tls.certresolver=myresolver"
+      - "traefik.http.services.pairdrop.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  portainer:
+    image: portainer/portainer-ce:2.39.5
+    container_name: portainer
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portainer/data:/data
+    networks:
+      proxy_network:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy_network"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.${DOMAIN}`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls.certresolver=myresolver"
+      - "traefik.http.routers.portainer.middlewares=vpn-peer@docker"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+networks:
+  proxy_network:
+    external: true
+  internal_services_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${SVC_SUBNET}
